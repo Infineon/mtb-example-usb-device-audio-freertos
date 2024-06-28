@@ -1,11 +1,11 @@
 /*******************************************************************************
-* File Name: audio_in.h
+* File Name: touch.h
 *
-*  Description:  This file contains the Audio In path routine declarations and
-*                constants.
+*  Description:  This file contains the function prototypes and constants
+*   used in touch.c.
 *
 *******************************************************************************
-* Copyright 2019-2023, Cypress Semiconductor Corporation (an Infineon company) or
+* Copyright 2023-2024, Cypress Semiconductor Corporation (an Infineon company) or
 * an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
 *
 * This software, including source code, documentation and related
@@ -37,26 +37,55 @@
 * so agrees to indemnify Cypress against all liability.
 *******************************************************************************/
 
-#ifndef AUDIO_IN_H
-#define AUDIO_IN_H
+#ifndef TOUCH_H
+#define TOUCH_H
 
+#include "cycfg_capsense.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 #if defined(__cplusplus)
 extern "C" {
 #endif
+/*******************************************************************************
+* Touch Application Constants
+*******************************************************************************/
+#define TOUCH_PERIOD_MS                 (10u)
+
+typedef enum
+{
+    TOUCH_DOWN          = 1 << 0,
+    TOUCH_LIFT          = 1 << 1,
+    TOUCH_SLIDE_RIGHT   = 1 << 2,
+    TOUCH_SLIDE_LEFT    = 1 << 3,
+    TOUCH_ALL        = 0xFF
+} touch_event_t;
+
+typedef struct {
+    bool     button0;
+    bool     button1;
+    bool     slider_status;
+    uint16_t slider_pos;
+} touch_status_t;
+
+/* Callback for CapSense events */
+typedef void (*touch_callback_t)(uint32_t widget, touch_event_t event, uint32_t value);
 
 /*******************************************************************************
-* Audio In Functions
+* Touch Functions
 *******************************************************************************/
-void audio_in_init(void);
-void audio_in_enable(void);
-void audio_in_disable(void);
-void audio_in_process(void *arg);
-void audio_in_endpoint_callback(void * pUserContext, const U8 ** ppNextBuffer, U32 * pNextPacketSize);
+void touch_init(void);
+bool touch_is_ready(void);
+void touch_update_baseline(void);
+void touch_process(void *arg);
+void touch_start_scan(void);
+void touch_stop_scan(void);
+void touch_get_state(touch_status_t *sensors);
+void touch_register_callback(touch_callback_t callback);
+void touch_enable_event(touch_event_t event, bool enable);
 
 #if defined(__cplusplus)
 }
 #endif
-#endif /* AUDIO_IN_H */
+#endif /* TOUCH_H */
 /* [] END OF FILE */

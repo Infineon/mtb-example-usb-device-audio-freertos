@@ -1,11 +1,11 @@
 /*******************************************************************************
-* File Name: audio_out.h
+* File Name: rtos.h
 *
-*  Description:  This file contains the Audio Out path routine declarations and
-*                constants.
+*  Description:  This file contains the function prototypes and constants
+*   related to the RTOS.
 *
 *******************************************************************************
-* Copyright 2019-2023, Cypress Semiconductor Corporation (an Infineon company) or
+* Copyright 2023-2024, Cypress Semiconductor Corporation (an Infineon company) or
 * an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
 *
 * This software, including source code, documentation and related
@@ -37,25 +37,34 @@
 * so agrees to indemnify Cypress against all liability.
 *******************************************************************************/
 
-#ifndef AUDIO_OUT_H
-#define AUDIO_OUT_H
+#ifndef RTOS_H
+#define RTOS_H
 
-#include <stdint.h>
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "semphr.h"
+#include "event_groups.h"
+
 #if defined(__cplusplus)
 extern "C" {
 #endif
+/***************************************
+*    RTOS Constants
+***************************************/
+#define RTOS_QUEUE_SIZE     (8U)
+#define RTOS_STACK_DEPTH    (256U)
+#define RTOS_TASK_PRIORITY  (2u)
 
-/*******************************************************************************
-* Audio Out Functions
-*******************************************************************************/
-void audio_out_init(void);
-void audio_out_enable(void);
-void audio_out_disable(void);
-void audio_out_process(void *arg);
-void audio_out_endpoint_callback(void * pUserContext, int NumBytesReceived, U8 ** ppNextBuffer, U32 * pNextBufferSize);
+/***************************************
+*    Task Handlers
+***************************************/
+extern TaskHandle_t rtos_audio_app_task;
+extern TaskHandle_t rtos_audio_run_task;
+extern TaskHandle_t rtos_touch_task;
 
 #if defined(__cplusplus)
 }
 #endif
-#endif /* AUDIO_OUT_H */
+#endif /* RTOS_H */
 /* [] END OF FILE */

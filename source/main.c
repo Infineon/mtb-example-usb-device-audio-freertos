@@ -8,7 +8,7 @@
 *
 *
 *******************************************************************************
-* Copyright 2021-2023, Cypress Semiconductor Corporation (an Infineon company) or
+* Copyright 2023-2024, Cypress Semiconductor Corporation (an Infineon company) or
 * an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
 *
 * This software, including source code, documentation and related
@@ -42,14 +42,14 @@
 
 #include "cyhal.h"
 #include "cybsp.h"
-#include "cycfg.h"
-
-#include "audio_app.h"
-#include "audio_in.h"
-#include "audio_out.h"
 #include "touch.h"
-#include "rtos.h"
 
+/***************************************
+*    RTOS Constants
+***************************************/
+#include "FreeRTOS.h"
+#include "task.h"
+#include "rtos.h"
 
 /*******************************************************************************
 * Macros
@@ -67,6 +67,7 @@ TaskHandle_t rtos_touch_task = NULL;
 /*******************************************************************************
 * Function Prototypes
 ********************************************************************************/
+void audio_app_process(void* arg);
 
 
 /*******************************************************************************

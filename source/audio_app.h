@@ -1,11 +1,10 @@
 /*****************************************************************************
-* File Name: audio.h
+* File Name: audio_app.h
 *
-*
-* Description: This file contains the constants declarations for emUSB stack.
+* Description: This file contains the constants used in audio_app.c.
 *
 *******************************************************************************
-* Copyright 2019-2023, Cypress Semiconductor Corporation (an Infineon company) or
+* Copyright 2023-2024, Cypress Semiconductor Corporation (an Infineon company) or
 * an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
 *
 * This software, including source code, documentation and related
@@ -37,33 +36,55 @@
 * so agrees to indemnify Cypress against all liability.
 *******************************************************************************/
 
-#ifndef CYCFG_EMUSBDEV_H
-#define CYCFG_EMUSBDEV_H
+#ifndef AUDIO_APP_H
+#define AUDIO_APP_H
 
-#include "USB_Audio.h"
-#include "USB_HID.h"
-#include "audio.h"
+#include "speaker_mic_configs.h"
 
 #if defined(__cplusplus)
 extern "C" {
 #endif
-/**********************************************************
-Macros
-***********************************************************/
+
+/*******************************************************************************
+* Macros
+********************************************************************************/
+#define AUDIO_IN_SAMPLE_FREQ        MICROPHONE_FREQUENCIES
+#define MI2C_TIMEOUT_MS     (10u)         /* in ms */
+#define MCLK_CODEC_DELAY_MS (10u)         /* in ms */
+#define MCLK_FREQ_HZ        ((384U) * (AUDIO_IN_SAMPLE_FREQ))/* in Hz */
+#define MCLK_DUTY_CYCLE     (50.0f)       /* in %  */
+#define USB_CLK_RESET_HZ    (100000)      /* in Hz */
+#define AUDIO_APP_MCLK_PIN  P5_0
+#define DELAY_TICKS         (50U)
+#define I2C_CLK_FREQ        (400000U)      /* in Hz */
+
+#define AUDIO_SAMPLING_RATE_22KHZ   (22050U)
+#define AUDIO_SAMPLING_RATE_16KHZ   (16000U)
+
+/* Audio Subsystem Clock. Typical values depends on the desired sample rate:
+ * 8KHz / 16 KHz / 32 KHz / 48 KHz    : 24.576 MHz
+ * 22.05 KHz / 44.1 KHz               : 22.579 MHz
+ */
+#if (AUDIO_SAMPLING_RATE_22KHZ == AUDIO_IN_SAMPLE_FREQ)
+#define AUDIO_SYS_CLOCK_HZ                  (45158400U)
+#else
+#define AUDIO_SYS_CLOCK_HZ                  (49152000U)
+#endif /* (AUDIO_SAMPLING_RATE_22KHZ == AUDIO_IN_SAMPLE_FREQ) */
+
+#define AUDIO_VOLUME_SIZE     (2U)
+
+/* Each report consists of 2 bytes:
+ * 1. The report ID (0x01) and a
+ * 2. bit mask containing 8 control events: */
+
+#define AUDIO_HID_REPORT_VOLUME_UP            (0x01u)
+#define AUDIO_HID_REPORT_VOLUME_DOWN          (0x02u)
+#define AUDIO_HID_REPORT_PLAY_PAUSE           (0x08u)
 
 #define HID_REPORT_PARAMS                       (35)
-
-/**********************************************************
-Global Variables
-***********************************************************/ 
-
-extern const USB_DEVICE_INFO usb_device_info;
-
-extern const USBD_AUDIO_IF_CONF audio_interfaces[NUM_INTERFACES];
-
 extern const U8 hid_report[HID_REPORT_PARAMS];
 
 #if defined(__cplusplus)
 }
 #endif
-#endif /* CYCFG_EMUSBDEV_H */
+#endif /* AUDIO_APP_H */

@@ -4,7 +4,7 @@
 * Description: This file contains the AK4954a codec control APIs.
 *
 *******************************************************************************
-* Copyright 2019-2023, Cypress Semiconductor Corporation (an Infineon company) or
+* Copyright 2023-2024, Cypress Semiconductor Corporation (an Infineon company) or
 * an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
 *
 * This software, including source code, documentation and related
@@ -81,7 +81,7 @@ uint32_t ak4954a_init(ak4954a_transmit_callback callback)
     
     /* Set MPWR pin Power Management */
     ret = ak4954a_transmit(AK4954A_REG_SIG_SEL1, AK4954A_SIG_SEL1_PMMP |
-                                                 AK4954A_SIG_SEL1_MGAIN_0dB);
+                                                 AK4954A_SIG_SEL1_MGAIN_6dB);
     if (ret) return ret;
     
     /* Clear Digital Filter Mode register */

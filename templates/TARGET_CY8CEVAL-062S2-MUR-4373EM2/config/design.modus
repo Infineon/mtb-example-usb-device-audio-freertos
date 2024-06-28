@@ -1521,7 +1521,7 @@
                 </Mux>
             </Netlist>
         </Device>
-        <Device mpn="Sterling-LWB+/CYW43439KUBG">
+        <Device mpn="LBEE5PK2AE/CYW4373EUBGT">
             <BlockConfig>
                 <Personality template="connectivity_bt" version="1.0">
                     <Block location="bt[0].power[0]" locked="true"/>

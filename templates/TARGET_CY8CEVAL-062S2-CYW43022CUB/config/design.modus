@@ -86,11 +86,6 @@
                         <Alias value="CYBSP_WIFI_WL_REG_ON"/>
                     </Aliases>
                 </Block>
-                <Block location="ioss[0].port[2].pin[7]">
-                    <Aliases>
-                        <Alias value="CYBSP_BT_DEVICE_WAKE"/>
-                    </Aliases>
-                </Block>
                 <Block location="ioss[0].port[3].pin[0]">
                     <Aliases>
                         <Alias value="CYBSP_BT_UART_RX"/>
@@ -114,6 +109,11 @@
                 <Block location="ioss[0].port[3].pin[4]">
                     <Aliases>
                         <Alias value="CYBSP_BT_POWER"/>
+                    </Aliases>
+                </Block>
+                <Block location="ioss[0].port[3].pin[5]">
+                    <Aliases>
+                        <Alias value="CYBSP_BT_DEVICE_WAKE"/>
                     </Aliases>
                 </Block>
                 <Block location="ioss[0].port[4].pin[0]">
@@ -1521,7 +1521,7 @@
                 </Mux>
             </Netlist>
         </Device>
-        <Device mpn="Sterling-LWB+/CYW43439KUBG">
+        <Device mpn="CYW43022CUB">
             <BlockConfig>
                 <Personality template="connectivity_bt" version="1.0">
                     <Block location="bt[0].power[0]" locked="true"/>

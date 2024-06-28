@@ -1,0 +1,111 @@
+// emUSBD audio configuration sample
+// to be used with Seggers emUSBD Audio Device Generator tool.
+//
+//! This configuration models an USB audio 1.0 device containing a speaker and a microphone,
+//! each connected to an USB endpoint:
+//!
+//!   +-------------+       +---------------+       +-------------------+
+//!   |             |       | Feature Unit  |       |                   |
+//!   |   Speaker   +<------+               +<------+  USB OUT endpoint |
+//!   |             |       | Mute / Volume |       |                   |
+//!   +-------------+       +---------------+       +-------------------+
+//!
+//!   +-------------+       +---------------+       +-------------------+
+//!   |             |       | Feature Unit  |       |                   |
+//!   | Microphone  +------>+               +------>+  USB IN endpoint  |
+//!   |             |       | Mute / Volume |       |                   |
+//!   +-------------+       +---------------+       +-------------------+
+//!
+//! The speaker uses two 16-bit channels (stereo) with sample frequencies 16000Hz.
+//! The microphone has a single 16-bit channel (stereo) with a sample frequencies 16000Hz.
+
+
+AudioDevice 'speaker_mic_configs' 1.0 {
+
+  CompilerMacros {
+    'SPEAKER_MIC_USB_PRODUCT_ID'    "0x1301";
+  }
+
+  //
+  // Speaker part
+  //
+
+  INPUT_TERMINAL 'USBIn' {
+    ChannelCluster: LeftFront, RightFront;
+  }
+
+  FEATURE_UNIT 'SpeakerControl' {
+    Input: 'USBIn';
+    Controls: MuteControl, VolumeControl;         // Master channel
+    Controls: None;                               // LeftFront
+    Controls: None;                               // RightFront
+  }
+
+  OUTPUT_TERMINAL 'Speaker' {
+    Description: "Speaker";
+    TerminalType: 0x301;
+    Input: 'SpeakerControl';
+  }
+
+  //
+  // Microphone part
+  //
+
+  INPUT_TERMINAL 'Microphone' {
+    Description: "Microphone";
+    TerminalType: 0x201;
+    ChannelCluster: CenterFront;
+  }
+
+  FEATURE_UNIT 'MicControl' {
+    Input: 'Microphone';
+    Controls: MuteControl, VolumeControl;         // Master channel
+    Controls: None;                               // CenterFront
+  }
+
+  OUTPUT_TERMINAL 'USBOut' {
+    Input: 'MicControl';
+  }
+
+
+  StreamingInterface 'Speaker' {
+
+    CompilerMacros {
+      'SPEAKER_FREQUENCIES'    "16000";
+    }
+
+    Alternate {
+      AUDIO_STREAM {  Description: "Audio Speaker";    }
+      // No endpoints in alternate setting 0
+    }
+
+    Alternate {
+      // 16-bit stereo, 16 kHz
+      // Full-speed packet size = 16 * 4 bytes (sample size) = 64
+      AUDIO_STREAM {  Description: "Audio Speaker";  Terminal: 'USBIn';  FormatTag: 1;   }
+      FORMAT_I {      NrChannels: 2;  SubframeSize: 2;  BitResolution: 16;  SamplingFrequency: 16000;  }
+      ENDPOINT {      Direction: OUT;  MaxPacketSize: 64;  Sync: Synchronous;  Attributes:  SamplingFrequencyControl;   }
+    }
+  }
+
+
+  StreamingInterface 'Microphone' {
+
+    CompilerMacros {
+      'MICROPHONE_FREQUENCIES'    "16000";
+    }
+
+    Alternate {
+      AUDIO_STREAM {  Description: "Audio Microphone";    }
+      // No endpoints in alternate setting 0
+    }
+
+    Alternate {
+      // 16-bit stereo, 16 kHz
+      // Full-speed packet size = 16 * 4 bytes (sample size) = 64
+      AUDIO_STREAM {  Description: "Audio Microphone";  Terminal: 'USBOut';  FormatTag: 1;   }
+      FORMAT_I {      NrChannels: 2;  SubframeSize: 2;  BitResolution: 16;  SamplingFrequency: 16000;  }
+      ENDPOINT {      Direction: IN;  MaxPacketSize: 64;  Sync: Synchronous;  Attributes:  SamplingFrequencyControl;   }
+    }
+  }
+}

@@ -1,11 +1,10 @@
 /*******************************************************************************
 * File Name: audio_app.c
 *
-*  Description: This file contains the application code for audio processing
-*
+* Description: This file contains the audio application code
 *
 *******************************************************************************
-* Copyright 2019-2023, Cypress Semiconductor Corporation (an Infineon company) or
+* Copyright 2023-2024, Cypress Semiconductor Corporation (an Infineon company) or
 * an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
 *
 * This software, including source code, documentation and related
@@ -37,115 +36,174 @@
 * so agrees to indemnify Cypress against all liability.
 *******************************************************************************/
 
-#include "audio.h"
-#include "audio_app.h"
-#include "audio_in.h"
-#include "audio_out.h"
-#include "USB.h"
-#include "cycfg_emusbdev.h"
-#include "USB_Audio.h"
-#include "USB_HID.h"
-#include "rtos.h"
+#include <stdio.h>
 #include "cy_pdl.h"
 #include "cyhal.h"
 #include "cybsp.h"
-#include "touch.h"
 #include "cycfg.h"
+#include "cy_i2s.h"
+#include "USB.h"
+#include "USB_AC.h"
+#include "USB_HID.h"
+#include "audio_app.h"
+#include "touch.h"
 #ifdef COMPONENT_AK4954A
     #include "ak4954a.h"
 #endif
+#include "USB_HW_Cypress_PSoC6.h"
 
+/*********************************************************************
+*
+*      AUDIO configurations: Audio 1.0 stereo Speaker, stereo Microphone, 16kHz sample frequency
+*
+**********************************************************************/
+#include "speaker_mic_configs.h"
 
+/*********************************************************************
+*
+*      RTOS #include section
+*
+**********************************************************************/
+#include "FreeRTOS.h"
+#include "rtos.h"
+#include "task.h"
+#include "queue.h"
 
-static USBD_AUDIO_INIT_DATA audio_init_data;
-static USB_HID_INIT_DATA    hid_init_data;
-USBD_AUDIO_HANDLE           usb_audio_context;
-USB_HID_HANDLE              usb_hid_control_context;
-static USB_ADD_EP_INFO      ep_out;
-static USB_ADD_EP_INFO      ep_in;
+/*********************************************************************
+*
+*      Forward declarations
+*
+**********************************************************************/
+#ifdef __cplusplus
+extern "C" {     /* Make sure we have C-declarations in C++ programs */
+#endif
+    void audio_app_process(void* arg);
+    void audio_class_init_data(void);
+    void audio_app_run(void* arg);
+#ifdef __cplusplus
+}
+#endif
 
-/*******************************************************************************
-* Macros
-********************************************************************************/
-#define MI2C_TIMEOUT_MS     (10u)         /* in ms */
-#define MCLK_CODEC_DELAY_MS (10u)         /* in ms */
-#define MCLK_FREQ_HZ        ((384U) * (AUDIO_IN_SAMPLE_FREQ))/* in Hz */
-#define MCLK_DUTY_CYCLE     (50.0f)       /* in %  */
-#define USB_CLK_RESET_HZ    (100000)      /* in Hz */
-#define AUDIO_APP_MCLK_PIN  P5_0
-#define DELAY_TICKS         (50U)
-#define I2C_CLK_FREQ        (400000U)      /* in Hz */
-/* Audio Subsystem Clock. Typical values depends on the desired sample rate:
- * 8KHz / 16 KHz / 32 KHz / 48 KHz    : 24.576 MHz
- * 22.05 KHz / 44.1 KHz               : 22.579 MHz
- */
+/*********************************************************************
+*
+*      Macros
+*
+**********************************************************************/
+#define AUDIO_DEVICE_VENDOR_ID               (0x0655)
 #if (AUDIO_SAMPLING_RATE_22KHZ == AUDIO_IN_SAMPLE_FREQ)
-#define AUDIO_SYS_CLOCK_HZ                  (45158400U)
+#define AUDIO_DEVICE_PRODUCT_ID              (0x0281)
 #else
-#define AUDIO_SYS_CLOCK_HZ                  (49152000U)
+#define AUDIO_DEVICE_PRODUCT_ID              (0x0280)
 #endif /* (AUDIO_SAMPLING_RATE_22KHZ == AUDIO_IN_SAMPLE_FREQ) */
 
+/*********************************************************************
+*
+*      Types
+*
+**********************************************************************/
+typedef enum {
+    MSG_SPEAKER_ON,
+    MSG_SPEAKER_OFF,
+    MSG_SPEAKER_DATA,
+    MSG_MIC_ON,
+    MSG_MIC_OFF,
+    MSG_MIC_DATA,
+    MSG_SPEAKERAUX_ON,
+    MSG_SPEAKERAUX_OFF,
+    MSG_SPEAKERAUX_DATA,
+} MSG_TYPE;
 
-/*******************************************************************************
-* Global Variables
-********************************************************************************/
-static uint8_t  audio_app_control_report[2] = {0x1, 0x0};
-uint32_t audio_app_current_sample_rate;
-uint8_t   audio_app_volume;
-uint8_t   audio_app_prev_volume;
+typedef struct {
+    MSG_TYPE   Event;
+    U32     NumBtyes;
+    void* pBuff;
+} MESSAGE;
+
+/*********************************************************************
+*
+*      Global Variables
+*
+**********************************************************************/
+TaskHandle_t rtos_audio_run_task = NULL;
+
+static QueueHandle_t    Mail_Box;
+static StaticQueue_t    Static_Queue;
+
+static USB_HID_INIT_DATA    hid_init_data;
+USB_HID_HANDLE            usb_hid_control_context;
+static uint8_t  audio_app_control_report[2] = { 0x1, 0x0 };
+static cy_rslt_t mi2c_transmit(uint8_t reg_addr, uint8_t data);
+
 static volatile bool usb_suspend_flag = false;
-U8       mic_mute;
-U8       speaker_mute;
+
+U8     mic_mute;
+U8     speaker_mute;
 
 uint8_t usb_comm_cur_volume[AUDIO_VOLUME_SIZE];
-uint8_t usb_comm_min_volume[AUDIO_VOLUME_SIZE] = {AUDIO_VOLUME_MIN_LSB, AUDIO_VOLUME_MIN_MSB};
-uint8_t usb_comm_max_volume[AUDIO_VOLUME_SIZE] = {AUDIO_VOLUME_MAX_LSB, AUDIO_VOLUME_MAX_MSB};
-uint8_t usb_comm_res_volume[AUDIO_VOLUME_SIZE] = {AUDIO_VOLUME_RES_LSB, AUDIO_VOLUME_RES_MSB};
+uint8_t   audio_app_volume;
+uint8_t   audio_app_prev_volume;
 
-bool                 audio_app_mute;
-uint8_t              current_speaker_format_index;
-uint8_t              current_microphone_format_index;
+/* Information that is used during enumeration. */
+static const USB_DEVICE_INFO usb_device_info = {
+  AUDIO_DEVICE_VENDOR_ID,        // VendorId
+  AUDIO_DEVICE_PRODUCT_ID,      // ProductId
+  "Infineon Technologies",      // VendorName
+  "emUSB Audio Device",     // ProductName
+  "13245678"      // SerialNumber
+};
+
+static const U32  speaker_frequencies[] = { SPEAKER_FREQUENCIES };
+static const U32  mic_frequencies[] = { MICROPHONE_FREQUENCIES };
+
+USBD_AC_RX_CTX RX;
+USBD_AC_TX_CTX TX;
+
+/* Buffers for audio data */
+static MESSAGE        Msg_Buff[5];
+static U16            mic_audio_buffer[64 / 2];
+static U32            speaker_audio_buffer[64 / 4];
+
 static cyhal_clock_t audio_clock;
 static cyhal_clock_t hf0_clock;
 
-static const cyhal_i2s_pins_t i2s_tx_pins = 
+static const cyhal_i2s_pins_t i2s_tx_pins =
 {
-    .sck  = P5_1,
-    .ws   = P5_2,
+    .sck = P5_1,
+    .ws = P5_2,
     .data = P5_3,
     .mclk = NC,
 };
 
-static const cyhal_i2s_pins_t i2s_rx_pins = 
+static const cyhal_i2s_pins_t i2s_rx_pins =
 {
-    .sck  = P5_4,
-    .ws   = P5_5,
+    .sck = P5_4,
+    .ws = P5_5,
     .data = P5_6,
     .mclk = NC,
 };
 
-static const cyhal_i2s_config_t i2s_config = 
+static const cyhal_i2s_config_t i2s_config =
 {
 #ifdef COMPONENT_AK4954A
-    .is_tx_slave    = true,     /* TX is Slave */
+    .is_tx_slave = true,     /* TX is Slave */
 #else
-    .is_tx_slave    = false,    /* TX is Master */
+    .is_tx_slave = false,   /* TX is Master */
 #endif
-    .is_rx_slave    = false,    /* RX is Master */
-    .mclk_hz        = 0,        /* External MCLK not used */
-    .channel_length = 16,       /* In bits */
-    .word_length    = 16,       /* In bits */
-    .sample_rate_hz = AUDIO_IN_SAMPLE_FREQ,    /* In Hz */
+    .is_rx_slave = false,   /* RX is Master */
+    .mclk_hz = 0,       /* External MCLK not used */
+    .channel_length = 16,      /* In bits */
+    .word_length = 16,     /* In bits */
+    .sample_rate_hz = AUDIO_IN_SAMPLE_FREQ, /* In Hz */
 };
 
 #ifdef COMPONENT_AK4954A
 /* Master I2C variables */
 static cyhal_i2c_t mi2c;
 
-static const cyhal_i2c_cfg_t mi2c_cfg = 
+static const cyhal_i2c_cfg_t mi2c_cfg =
 {
-    .is_slave        = false,
-    .address         = 0,
+    .is_slave = false,
+    .address = 0,
     .frequencyhal_hz = I2C_CLK_FREQ
 };
 #endif
@@ -156,42 +214,77 @@ cyhal_clock_t pll_clock;
 static cyhal_pwm_t mclk_pwm;
 
 /* Tolerance Values */
-const cyhal_clock_tolerance_t tolerance_0_p = {CYHAL_TOLERANCE_PERCENT, 0};
-const cyhal_clock_tolerance_t tolerance_1_p = {CYHAL_TOLERANCE_PERCENT, 1};
+const cyhal_clock_tolerance_t tolerance_0_p = { CYHAL_TOLERANCE_PERCENT, 0 };
+const cyhal_clock_tolerance_t tolerance_1_p = { CYHAL_TOLERANCE_PERCENT, 1 };
 
-/* Speaker configurations */
-static USBD_AUDIO_IF_CONF * speaker_config = (USBD_AUDIO_IF_CONF *) &audio_interfaces[0];
+struct AC_Global_t {
+    U32   CurrSpeakerFreq;
+    U32   CurrSpeakerAuxFreq;
+    U32   CurrMicFreq;
+    U16   SpeakerVolume;
+    U8  SpeakerMute[3];
+    U8  SpeakerAltSetting;
+    U8  SpeakerCurrBuff;
+    U8  MicrophoneMute;
+    U16   MicrophoneVolume;
+    U8  MicrophoneAltSetting;
+    U32   MicSoundSize;
+    U32   MicDataRate;
+    U32   MicSilentPackets;
+    U32   MicDataSend;
+    U32   MicSilentCount;
+    U32   RemData;
+    U16   SideToneVolume;
+    U8  SideToneMute;
+    const U8* pMicSound;
+    const U8* pMicData;
+    USBD_AC_STREAM_INTF_INFO MicInfo;
+    USBD_AC_STREAM_INTF_INFO SpeakerInfo;
+};
 
-/* Microphone configurations */
-static USBD_AUDIO_IF_CONF  * microphone_config = (USBD_AUDIO_IF_CONF *) &audio_interfaces[1];
+static struct AC_Global_t AC_Global;
 
-
-/*******************************************************************************
-* Function Prototypes
-********************************************************************************/
-static void audio_app_touch_events(uint32_t widget, touch_event_t event, uint32_t value);
-static void audio_clock_init(void);
-#ifdef COMPONENT_AK4954A
-static void audio_app_update_codec_volume(void);
-static cy_rslt_t mi2c_transmit(uint8_t reg_addr, uint8_t data);
-#endif /* COMPONENT_AK4954A */
-
-
+/*********************************************************************
+*                          hid_report
+*
+*  This report is generated according to HID spec and
+*  HID Usage Tables specifications.
+***********************************************************************/
+const U8 hid_report[] = {
+    0x05, 0x0c,                 // USAGE_PAGE (Consumer Devices)
+    0x09, 0x01,                 // USAGE (Consumer Control)
+    0xa1, 0x01,                 // COLLECTION (Application)
+    0x85, 0x01,                 //   REPORT_ID (1)
+    0x15, 0x00,                 //   LOGICAL_MINIMUM (0)
+    0x25, 0x01,                 //   LOGICAL_MAXIMUM (1)
+    0x09, 0xe9,                 //   USAGE (Volume Up)
+    0x09, 0xea,                 //   USAGE (Volume Down)
+    0x09, 0xe2,                 //   USAGE (Mute)
+    0x09, 0xcd,                 //   USAGE (Play/Pause)
+    0x09, 0xb5,                 //   USAGE (Scan Next Track)
+    0x09, 0xb6,                 //   USAGE (Scan Previous Track)
+    0x09, 0xbc,                 //   USAGE (Repeat)
+    0x09, 0xb9,                 //   USAGE (Random Play)
+    0x75, 0x01,                 //   REPORT_SIZE (1)
+    0x95, 0x08,                 //   REPORT_COUNT (8)
+    0x81, 0x02,                 //   INPUT (Data,Var,Abs)
+    0xc0                           // END_COLLECTION
+};
 
 /********************************************************************************
- * Function Name: vApplicationTickHook
- ********************************************************************************
- * Summary:
- *  Tick hook function called at every tick (1ms). It checks for the activity in
- *  the USB bus.
- *
- * Parameters:
- *  None
- *
- * Return:
- *  None
- *
- *******************************************************************************/
+* Function Name: vApplicationTickHook
+********************************************************************************
+* Summary:
+*  Tick hook function called at every tick (1ms). It checks for the activity in
+*  the USB bus.
+*
+* Parameters:
+*  None
+*
+* Return:
+*  None
+*
+*******************************************************************************/
 void vApplicationTickHook(void)
 {
     /* Supervisor of suspend conditions on the bus */
@@ -212,482 +305,522 @@ void vApplicationTickHook(void)
 }
 
 /********************************************************************************
- * Function Name: audio_control_callback
- ********************************************************************************
- * Summary:
- *  Callback function on detection of control action from the USB middleware
- *
- * Parameters:
- *  void * pUserContext -
- *  U8 Event -
- *  U8 ControlSelector -
- *  U8 * pBuffer -
- *  U32 NumBytes -
- *  U8 InterfaceNo -
- *  U8 AltSetting -
- *
- * Return:
- *  int - audio event handling status
- *
- *******************************************************************************/
-static int audio_control_callback(void * pUserContext, U8 Event, U8 Unit, U8 ControlSelector, U8 * pBuffer, U32 NumBytes, U8 InterfaceNo, U8 AltSetting) {
-    int retVal;
-
-    (void)pUserContext;
-    (void)InterfaceNo;
-    retVal = 0;
-
-    switch (Event)
-    {
-
-        case USB_AUDIO_PLAYBACK_START:
-        {
-            /* Host enabled transmission */
-            audio_out_enable();
-            break;
-        }
-        case USB_AUDIO_PLAYBACK_STOP:
-        {
-            /* Host disabled transmission. Some hosts do not always send this! */
-            audio_out_disable();
-            break;
-        }
-        case USB_AUDIO_RECORD_START:
-        {
-            /* Host enabled reception */
-            audio_in_enable();
-            break;
-        }
-        case USB_AUDIO_RECORD_STOP:
-        {
-            /* Host disabled reception. Some hosts do not always send this! */
-            audio_in_disable();
-            break;
-        }
-        case USB_AUDIO_SET_CUR:
-        {
-            switch (ControlSelector) 
-            {
-                case USB_AUDIO_MUTE_CONTROL:
-                {
-                    if(1U == NumBytes)
-                    {
-                        if(Unit == microphone_config->pUnits->FeatureUnitID)
-                        {
-                            mic_mute = *pBuffer;
-                        }
-                        if(Unit == microphone_config->pUnits->FeatureUnitID)
-                        {
-                            speaker_mute = *pBuffer;
-                        }
-                    }
-                    break;
-                }
-                case USB_AUDIO_VOLUME_CONTROL:
-                {
-                    if(2U == NumBytes)
-                    {
-                        memcpy(usb_comm_cur_volume, pBuffer, sizeof(usb_comm_cur_volume));
-                    }
-                    break;
-                }
-                case USB_AUDIO_SAMPLING_FREQ_CONTROL:
-                {
-                    if (3U == NumBytes)
-                    {
-                        if (Unit == speaker_config->pUnits->FeatureUnitID)
-                        {
-                            if ((AltSetting > 0) && (AltSetting < speaker_config->NumFormats))
-                            {
-                                current_speaker_format_index = AltSetting - 1;
-                            }
-                        }
-                        if (Unit == microphone_config->pUnits->FeatureUnitID)
-                        {
-                            if ((AltSetting > 0) && (AltSetting < microphone_config->NumFormats))
-                            {
-                                current_microphone_format_index = AltSetting - 1;
-                            }
-                        }
-                    }
-                    break;
-                }
-                default:
-                    retVal = 1;
-                break;
-            }
-
-            break;
-        }
-        case USB_AUDIO_GET_CUR:
-        {
-            switch (ControlSelector)
-            {
-                case USB_AUDIO_MUTE_CONTROL:
-                {
-                      pBuffer[0] = 0;
-                      break;
-                }
-                case USB_AUDIO_VOLUME_CONTROL:
-                {
-                    pBuffer[0] = 0;
-                    pBuffer[0] = 0;
-                    break;
-                }
-                case USB_AUDIO_SAMPLING_FREQ_CONTROL:
-                {
-                    if (Unit == speaker_config->pUnits->FeatureUnitID)
-                    {
-                        pBuffer[0] =  speaker_config->paFormats[current_speaker_format_index].SamFreq & 0xff;
-                        pBuffer[1] = (speaker_config->paFormats[current_speaker_format_index].SamFreq >> 8) & 0xff;
-                        pBuffer[2] = (speaker_config->paFormats[current_speaker_format_index].SamFreq >> 16) & 0xff;
-                    }
-
-                    if (Unit == microphone_config->pUnits->FeatureUnitID)
-                    {
-                        pBuffer[0] =  microphone_config->paFormats[current_microphone_format_index].SamFreq & 0xff;
-                        pBuffer[1] = (microphone_config->paFormats[current_microphone_format_index].SamFreq >> 8) & 0xff;
-                        pBuffer[2] = (microphone_config->paFormats[current_microphone_format_index].SamFreq >> 16) & 0xff;
-                    }
-                    break;
-                }
-                default:
-                {
-                    pBuffer[0] = 0;
-                    pBuffer[1] = 0;
-                    break;
-                }
-            }
-            break;
-        }
-        case USB_AUDIO_SET_MIN:
-        {
-            break;
-        }
-        case USB_AUDIO_GET_MIN:
-        {
-            switch (ControlSelector)
-            {
-                case USB_AUDIO_VOLUME_CONTROL:
-                {
-                    pBuffer[0] = usb_comm_min_volume[0];
-                    pBuffer[1] = usb_comm_min_volume[1];
-                    break;
-                }
-                default:
-                {
-                    pBuffer[0] = 0;
-                    pBuffer[1] = 0;
-                    break;
-                }
-            }
-            break;
-        }
-        case USB_AUDIO_SET_MAX:
-        {
-            break;
-        }
-        case USB_AUDIO_GET_MAX:
-        {
-            switch (ControlSelector)
-            {
-                case USB_AUDIO_VOLUME_CONTROL:
-                {
-                    pBuffer[0] = usb_comm_max_volume[0];
-                    pBuffer[1] = usb_comm_max_volume[1];
-                    break;
-                }
-                default:
-                {
-                    pBuffer[0] = 0;
-                    pBuffer[1] = 0;
-                    break;
-                }
-            }
-            break;
-        }
-        case USB_AUDIO_SET_RES:
-        {
-            break;
-        }
-        case USB_AUDIO_GET_RES:
-        {
-            switch (ControlSelector)
-            {
-                case USB_AUDIO_VOLUME_CONTROL:
-                {
-                    pBuffer[0] = usb_comm_res_volume[0];
-                    pBuffer[1] = usb_comm_res_volume[1];
-                    break;
-                }
-                default:
-                {
-                    pBuffer[0] = 0;
-                    pBuffer[1] = 0;
-                    break;
-                }
-            }
-            break;
-        }
-
-        default:
-        {
-            retVal = 1;
-            break;
-        }
-    }
-    return retVal;
-}
-
-/*********************************************************************
-* Function name: add_audio
-**********************************************************************
-* Summary:
-*  Add a USB Audio interface to the USB stack.
-*
-* Parameters:
-*  None
-*
-* Return:
-*  USBD_AUDIO_HANDLE - Handle for added audio instance
-************************************************************************/
-static USBD_AUDIO_HANDLE add_audio(void) {
-    
-    USBD_AUDIO_HANDLE hInst;
-    
-    /* OUT endpoint configurations */
-    ep_out.Flags             = USB_ADD_EP_FLAG_USE_ISO_SYNC_TYPES;
-    ep_out.InDir             = USB_DIR_OUT;
-    ep_out.Interval          = 8;
-    ep_out.MaxPacketSize     = MAX_AUDIO_OUT_PACKET_SIZE_BYTES;
-    ep_out.TransferType      = USB_TRANSFER_TYPE_ISO;
-    ep_out.ISO_Type          = USB_ISO_SYNC_TYPE_ASYNCHRONOUS;
-
-
-    /* IN endpoint configurations */
-    ep_in.Flags              = USB_ADD_EP_FLAG_USE_ISO_SYNC_TYPES;
-    ep_in.InDir              = USB_DIR_IN;
-    ep_in.Interval           = 8;
-    ep_in.MaxPacketSize      = MAX_AUDIO_IN_PACKET_SIZE_BYTES;
-    ep_in.TransferType       = USB_TRANSFER_TYPE_ISO;
-    ep_in.ISO_Type           = USB_ISO_SYNC_TYPE_ASYNCHRONOUS; 
-
-
-    memset(&audio_init_data, 0, sizeof(audio_init_data));
-
-    audio_init_data.EPOut           = USBD_AddEPEx(&ep_out, NULL, 0);
-    audio_init_data.EPIn            = USBD_AddEPEx(&ep_in, NULL, 0);
-    audio_init_data.pfOnOut         = &audio_out_endpoint_callback;
-    audio_init_data.pfOnIn          = &audio_in_endpoint_callback;
-    audio_init_data.OutPacketSize   = MAX_AUDIO_OUT_PACKET_SIZE_BYTES;
-    audio_init_data.pfOnControl     = audio_control_callback;
-    audio_init_data.NumInterfaces   = SEGGER_COUNTOF(audio_interfaces);
-    audio_init_data.paInterfaces    = audio_interfaces;
-    audio_init_data.pOutUserContext = NULL;
-    audio_init_data.pInUserContext  = NULL;
-    audio_init_data.pControlUserContext  = NULL;
-
-    hInst = USBD_AUDIO_Add(&audio_init_data);
-    
-    return hInst;
-
-}
-
-
-/*********************************************************************
-* Function name: add_hid_control
-**********************************************************************
-* Summary:
-*  Add HID mouse class to USB stack
-*
-* Parameters:
-*  None
-*
-* Return:
-*  USBD_AUDIO_HANDLE - Handle for added hid instance
-**********************************************************************/
-
-static USB_HID_HANDLE add_hid_control(void) {
-  
-  USB_HID_HANDLE hInst;
-  
-  USB_ADD_EP_INFO   EPIntIn;
-
-  memset(&hid_init_data, 0, sizeof(hid_init_data));
-  EPIntIn.Flags           = 0;                             // Flags not used.
-  EPIntIn.InDir           = USB_DIR_IN;                    // IN direction (Device to Host)
-  EPIntIn.Interval        = 8;                             // Interval of 1 ms (125 us * 8)
-  EPIntIn.MaxPacketSize   = 2;                             // Report size.
-  EPIntIn.TransferType    = USB_TRANSFER_TYPE_INT;         // Endpoint type - Interrupt.
-  hid_init_data.EPIn      = USBD_AddEPEx(&EPIntIn, NULL, 0);
-
-  hid_init_data.pReport = hid_report;
-  hid_init_data.NumBytesReport = sizeof(hid_report);
-  hInst = USBD_HID_Add(&hid_init_data);
-
-  return hInst;
-}
-
-
-/*********************************************************************
-* Function name: audio_app_init
-**********************************************************************
-* Summary:
-*  Initializes hardware peripherals necessary for this audio application
-*
-* Parameters:
-*  None
-*
-* Return:
-*  None
-**********************************************************************/
-void audio_app_init(void)
-{
-    cy_rslt_t result;
-
-    /* Initialize the audio clock based on audio sample rate */
-    audio_clock_init();
-
-    /* Initialize the User  LED */
-    result = cyhal_gpio_init(CYBSP_USER_LED, CYHAL_GPIO_DIR_OUTPUT, CYHAL_GPIO_DRIVE_STRONG, CYBSP_LED_STATE_OFF);
-    if(result != CY_RSLT_SUCCESS)
-    {
-        CY_ASSERT(0);
-    }
-    /* Initialize the Master Clock with a PWM */
-    result = cyhal_pwm_init(&mclk_pwm, (cyhal_gpio_t) AUDIO_APP_MCLK_PIN, NULL);
-    if(result != CY_RSLT_SUCCESS)
-    {
-        CY_ASSERT(0);
-    }
-    result = cyhal_pwm_set_duty_cycle(&mclk_pwm, MCLK_DUTY_CYCLE, MCLK_FREQ_HZ);
-    if(result != CY_RSLT_SUCCESS)
-    {
-        CY_ASSERT(0);
-    }
-    result = cyhal_pwm_start(&mclk_pwm);
-    if(result != CY_RSLT_SUCCESS)
-    {
-        CY_ASSERT(0);
-    }
-    /* Wait for the MCLK to clock the audio codec */
-    result = cyhal_system_delay_ms(MCLK_CODEC_DELAY_MS);
-    if(result != CY_RSLT_SUCCESS)
-    {
-        CY_ASSERT(0);
-    }
-
-#ifdef COMPONENT_AK4954A
-    result = cyhal_i2c_init(&mi2c, CYBSP_I2C_SDA, CYBSP_I2C_SCL, NULL);
-    if(result != CY_RSLT_SUCCESS)
-    {
-        CY_ASSERT(0);
-    }
-    result = cyhal_i2c_configure(&mi2c, &mi2c_cfg);
-    if(result != CY_RSLT_SUCCESS)
-    {
-        CY_ASSERT(0);
-    }
-    result = ak4954a_init(mi2c_transmit);
-    if (result != 0)
-    {
-        NVIC_SystemReset();
-    }
-    ak4954a_activate();
-    result = ak4954a_adjust_volume(AK4954A_HP_DEFAULT_VOLUME);
-    if(result != CY_RSLT_SUCCESS)
-    {
-        CY_ASSERT(0);
-    }
-#endif
-    /* Initialize the I2S block */
-    result = cyhal_i2s_init(&i2s, &i2s_tx_pins, &i2s_rx_pins, &i2s_config, &audio_clock);
-    if(result != CY_RSLT_SUCCESS)
-    {
-        CY_ASSERT(0);
-    }
-    USBD_Init();
-    /* Set device information*/
-    USBD_SetDeviceInfo(&usb_device_info);
-    /* Add Audio endpoints to the USB stack */
-    usb_audio_context = add_audio();
-    /* Add HID Audio control endpoint to the USB stack */
-    usb_hid_control_context = add_hid_control();
-    /* Set USB read/write timeouts */
-    USBD_AUDIO_Set_Timeouts(0, READ_TIMEOUT, WRITE_TIMEOUT);
-    /* Register and enable touch events */
-    touch_register_callback(audio_app_touch_events);
-    touch_enable_event(TOUCH_ALL, true);
-    /* Start the USB device stack */
-    USBD_Start();
-    /* Schedules task for IN endpoint. */
-    audio_in_init();
-    /* Schedules task for OUT endpoint. */
-    audio_out_init();
-    cyhal_gpio_write(CYBSP_USER_LED, CYBSP_LED_STATE_OFF);
-}
-
-
-/*******************************************************************************
-* Function Name: audio_app_process
+* Function Name: audio_set_interface_control_callback
 ********************************************************************************
 * Summary:
-*   Main audio task. Initialize the USB communication and the audio application.
-*   In the main loop, process requests to change
-*   the volume.
+*  Definition of the callback which is called when the hosts sets an alternate 
+*  setting on an audio interface.
 *
 * Parameters:
-*  void *arg - arguments for audio processing function
+*  InterfaceNo - Number of the audio streaming interface.
+*  NewAltSetting - Alternate setting selected by the host.
 *
 * Return:
 *  None
+*
 *******************************************************************************/
-void audio_app_process(void *arg)
-{
-    volatile bool usb_suspended = false;
-    volatile bool usb_connected = false;
-    int32_t usbd_stat;
+static void audio_set_interface_control_callback(unsigned InterfaceNo, unsigned NewAltSetting) {
+    MESSAGE Msg;
+    BaseType_t xHigherPriorityTaskWoken;
 
-    (void) arg;
-
-    audio_app_init();
-    while(1)
-    {
-        vTaskDelay(pdMS_TO_TICKS(DELAY_TICKS));
-        /* Check if suspend condition is detected on the bus */
-        if (usb_suspend_flag)
-        {
-            if (!usb_suspended)
-            {
-                usb_suspended = true;
-                usb_connected = false;
-                /* Stop providing audio data to the host */
-                USBD_AUDIO_Stop_Play(usb_audio_context);
-            }
+    switch (InterfaceNo) {
+    case USBD_AC_INTERFACE_Speaker:
+#if USBD_AC_AUDIO_VERSION == 1
+        /*
+         * If an alternate setting has only a single sample frequency,
+         * then setting AltInterface also must set the sample frequency.
+         * If an alternate setting has multiple sample frequencies
+         * this should be commented out.
+         */
+        if (NewAltSetting > 0) {
+            AC_Global.CurrSpeakerFreq = speaker_frequencies[NewAltSetting - 1];
         }
-        else /* USB device connected */
-        {
-            if (!usb_connected)
-            {
-                usb_connected = true;
-                usb_suspended = false;
-                /* Start providing audio data to the host */
-                usbd_stat = USBD_AUDIO_Start_Play(usb_audio_context, NULL);
-                configASSERT(0 == usbd_stat);
-            }
-            usbd_stat = USBD_HID_Write(usb_hid_control_context, audio_app_control_report, 2, 0);
-            /* configASSERT(2 == usbd_stat); */
-            audio_app_control_report[0] = 0x01;
-            audio_app_control_report[1] = 0;
-            /* Send out report data */
-            usbd_stat = USBD_HID_Write(usb_hid_control_context, audio_app_control_report, 2, 0);
-            /* configASSERT(2 == usbd_stat); */
-#ifdef COMPONENT_AK4954A
-            audio_app_update_codec_volume();
 #endif
+        AC_Global.SpeakerInfo = *USBD_AC_GetStreamInfo(USBD_AC_INTERFACE_Speaker, NewAltSetting);
+        AC_Global.SpeakerAltSetting = NewAltSetting;
+        Msg.Event = (NewAltSetting == 0) ? MSG_SPEAKER_OFF : MSG_SPEAKER_ON;
+
+        xHigherPriorityTaskWoken = pdFALSE;
+        xQueueSendFromISR(Mail_Box, &Msg, &xHigherPriorityTaskWoken);
+        if (xHigherPriorityTaskWoken) {
+            /* Actual macro used here is port specific. */
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        }
+        break;
+
+    case USBD_AC_INTERFACE_Microphone:
+#if USBD_AC_AUDIO_VERSION == 1
+        /* Setting AltInterface also sets the sample frequency */
+        if (NewAltSetting > 0) {
+            AC_Global.CurrMicFreq = mic_frequencies[NewAltSetting - 1];
+        }
+#endif
+        AC_Global.MicInfo = *USBD_AC_GetStreamInfo(USBD_AC_INTERFACE_Microphone, NewAltSetting);
+        AC_Global.MicrophoneAltSetting = NewAltSetting;
+        Msg.Event = (NewAltSetting == 0) ? MSG_MIC_OFF : MSG_MIC_ON;
+
+        xHigherPriorityTaskWoken = pdFALSE;
+        xQueueSendFromISR(Mail_Box, &Msg, &xHigherPriorityTaskWoken);
+        if (xHigherPriorityTaskWoken) {
+            /* Actual macro used here is port specific. */
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        }
+        break;
+    }
+}
+
+/********************************************************************************
+* Function Name: audio_out_callback
+********************************************************************************
+* Summary:
+*  Definition of the callback which is called when audio data was received from the host.
+*  pRxData->Numbytes bytes of data were received into pRxData->pBuffer.
+*  The function must reinitialize the members pBuffer, NumBytes and PaxPackets before it returns.
+*  This callback is called in interrupt context and must not block. The audio data must not be processed
+*  inside this function, instead a task should be triggered that does the audio processing and this function
+*  should return as fast as possible. After this functions has returned, the next USB transfer is started
+*  immediately. Therefore the member 'pBuffer' should be initialized to point to a different buffer to avoid
+*  overwriting the data just received (double buffering mechanism is recommended).
+*
+* Parameters:
+*  Event - Event occurred on the audio channel.
+*  pRxData - Pointer to a USBD_AC_RX_DATA structure. The contents is valid only, if Event == USBD_AC_EVENT_DATA_RECEIVED.
+*
+* Return:
+*  None
+*
+*******************************************************************************/
+static void audio_out_callback(USBD_AC_EVENT Event, USBD_AC_RX_DATA* pRxData) {
+    MESSAGE Msg;
+
+    switch (Event) {
+    case USBD_AC_EVENT_DATA_RECEIVED:
+        Msg.Event = MSG_SPEAKER_DATA;
+        Msg.NumBtyes = pRxData->NumBytes;
+        Msg.pBuff = pRxData->pBuffer;
+
+        BaseType_t xHigherPriorityTaskWoken;
+        xHigherPriorityTaskWoken = pdFALSE;
+        xQueueSendFromISR(Mail_Box, &Msg, &xHigherPriorityTaskWoken);
+        if (xHigherPriorityTaskWoken) {
+            /* Actual macro used here is port specific. */
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        }
+
+        AC_Global.SpeakerCurrBuff ^= 1;
+        pRxData->pBuffer = speaker_audio_buffer;
+        pRxData->NumBytes = sizeof(speaker_audio_buffer);
+        pRxData->NumPackets = 0;  /* Maximum possible */
+        break;
+
+    default:
+        break;
+    }
+}
+
+/********************************************************************************
+* Function Name: audio_in_callback
+********************************************************************************
+* Summary:
+*  Definition of the callback which is called when audio data was sent to the host.
+*  The function should initiate to send more data.
+*
+* Parameters:
+*  Event - Event occurred on the audio channel.
+*  pData - Pointer to the data send, that was provided to the USBD_AC_Send() function.
+*  pContext - Pointer from the USBD_AC_RX_CTX structure.
+*
+* Return:
+*  None
+*
+*******************************************************************************/
+static void audio_in_callback(USBD_AC_EVENT Event, const void* pData, void* pUserContext) {
+    MESSAGE Msg;
+
+    USB_USE_PARA(pData);
+    USB_USE_PARA(pUserContext);
+
+    switch (Event) {
+    case USBD_AC_EVENT_DATA_SEND:
+        Msg.Event = MSG_MIC_DATA;
+
+        BaseType_t xHigherPriorityTaskWoken;
+        xHigherPriorityTaskWoken = pdFALSE;
+        xQueueSendFromISR(Mail_Box, &Msg, &xHigherPriorityTaskWoken);
+        if (xHigherPriorityTaskWoken) {
+            /* Actual macro used here is port specific. */
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+/********************************************************************************
+* Function Name: audio_feedback_endpoint_callback
+********************************************************************************
+* Summary:
+*  audio_feedback_endpoint_callback
+*
+* Parameters:
+*  None
+*
+* Return:
+*  None
+*
+*******************************************************************************/
+static void audio_feedback_endpoint_callback(void* arg)
+{
+    uint32_t DataRate;
+    uint32_t num_samples;
+
+    num_samples = Cy_I2S_GetNumInTxFifo(i2s.base);
+
+    /* Calculate number of samples per interval as 16.16 fix point number */
+    /* CurrSpeakerFreq * (Interval in micro frames) / 8 / 1000 * 2^16    */
+
+    if (num_samples > 128)
+    {
+        DataRate = (((15000 << AC_Global.SpeakerInfo.IntervalExp) << 13) + 500) / 1000;
+    }
+    else if (num_samples < 128)
+    {
+        DataRate = (((17000 << AC_Global.SpeakerInfo.IntervalExp) << 13) + 500) / 1000;
+    }
+    else
+    {
+        DataRate = (((AC_Global.CurrSpeakerFreq << AC_Global.SpeakerInfo.IntervalExp) << 13) + 500) / 1000;
+    }
+
+    USBD_AC_SetFeedbackDataRate(&RX, DataRate);
+}
+
+/********************************************************************************
+* Function Name: audio_app_run
+********************************************************************************
+* Summary:
+*  Run audio application.
+*
+* Parameters:
+*  None
+*
+* Return:
+*  None
+*
+*******************************************************************************/
+void audio_app_run(void* arg) {
+    I8 SpeakerActive = 0;
+    I8 MicActive = 0;
+    MESSAGE Msg;
+    U32 SpeakerDataCnt = 0;
+    cy_rslt_t res;
+    uint32_t data_to_write;
+    size_t audio_in_count;
+
+    for (;;) {
+        USB_MEMSET(&AC_Global, 0, sizeof(AC_Global));
+        while ((USBD_GetState() & (USB_STAT_CONFIGURED | USB_STAT_SUSPENDED)) != USB_STAT_CONFIGURED) {
+            USB_OS_Delay(50);
+        }
+
+        while ((USBD_GetState() & (USB_STAT_CONFIGURED | USB_STAT_SUSPENDED)) == USB_STAT_CONFIGURED) {
+
+            if (xQueueReceive(Mail_Box, &Msg, 100) == pdFALSE) {
+                continue;
+            }
+
+            switch (Msg.Event) {
+            case MSG_SPEAKER_ON:
+                if (SpeakerActive != 0) {
+                    USBD_AC_CloseRXStream(&RX);
+                    SpeakerActive = 0;
+                }
+
+                /* Clear I2S TX FIFO */
+                Cy_I2S_ClearTxFifo(i2s.base);
+
+                /* Start the I2S TX if disabled */
+                if (0U == (Cy_I2S_GetCurrentState(i2s.base) & CY_I2S_TX_START))
+                {
+                    res = cyhal_i2s_start_tx(&i2s);
+                    if (res != CY_RSLT_SUCCESS)
+                    {
+                        CY_ASSERT(0);
+                    }
+                }
+
+                memset(&RX, 0, sizeof(RX));
+                RX.Interface = USBD_AC_INTERFACE_Speaker;
+                RX.RxData.pBuffer = speaker_audio_buffer;
+                RX.RxData.NumBytes = sizeof(speaker_audio_buffer);
+                RX.RxData.NumPackets = 0;  /* Maximum possible */
+                RX.RxData.Timeout = 5000;
+                RX.pfCallback = audio_out_callback;
+                RX.pfSOFCallback = audio_feedback_endpoint_callback;
+                RX.FeedbackInterval = 10;
+
+                AC_Global.SpeakerCurrBuff = 0;
+
+                if (USBD_AC_OpenRXStream(&RX) == 0) {
+                    SpeakerActive = 1;
+                }
+
+                break;
+            case MSG_SPEAKER_OFF:
+                if (SpeakerActive != 0) {
+                    USBD_AC_CloseRXStream(&RX);
+                    SpeakerActive = 0;
+                }
+                break;
+            case MSG_SPEAKER_DATA:
+                SpeakerDataCnt = Msg.NumBtyes;
+
+                if (SpeakerDataCnt > 0) {
+                    data_to_write = SpeakerDataCnt / 2;
+                    /* Write data to I2S Tx */
+                    res = cyhal_i2s_write(&i2s, speaker_audio_buffer, (size_t*) &data_to_write);
+                    if (res != CY_RSLT_SUCCESS)
+                    {
+                        CY_ASSERT(0);
+                    }
+                }
+
+                break;
+
+            case MSG_MIC_ON:
+                if (MicActive != 0) {
+                    USBD_AC_CloseTXStream(&TX);
+                    MicActive = 0;
+                }
+
+                /* Clear I2S RX FIFO */
+                Cy_I2S_ClearRxFifo(i2s.base);
+
+                /* Run the I2S RX all the time */
+                res = cyhal_i2s_start_rx(&i2s);
+                if(res != CY_RSLT_SUCCESS)
+                {
+                    CY_ASSERT(0);
+                }
+
+                memset(&TX, 0, sizeof(TX));
+                TX.Interface = USBD_AC_INTERFACE_Microphone;
+                TX.Timeout = 5000;
+                TX.pfCallback = audio_in_callback;
+
+                if (USBD_AC_OpenTXStream(&TX) == 0) {
+                    /* Clear Audio In buffer */
+                    memset(mic_audio_buffer, 0, sizeof(mic_audio_buffer));
+                    MicActive = 1;
+
+                    USBD_AC_Send(&TX, 1, 64, mic_audio_buffer);
+                }
+                break;
+
+            case MSG_MIC_OFF:
+                if (MicActive != 0) {
+                    USBD_AC_CloseTXStream(&TX);
+                    MicActive = 0;
+                }
+                break;
+
+            case MSG_MIC_DATA:
+                audio_in_count = 32;
+                res = cyhal_i2s_read(&i2s, (void*) mic_audio_buffer, &audio_in_count);
+                if (res != CY_RSLT_SUCCESS)
+                {
+                    CY_ASSERT(0);
+                }
+                USBD_AC_Send(&TX, 1, 64, mic_audio_buffer);
+                break;
+
+            default:
+                break;
+            }
         }
     }
 }
+
+/********************************************************************************
+* Function Name: audio_control_get_callback
+********************************************************************************
+* Summary:
+*  For audio 1.0 control requests!
+*  Definition of the callback which is called when an audio get requests is received.
+*  This callback is called in interrupt context and must not block.
+*
+* Parameters:
+*  pReqInfo  : Contains information about the type of the control request.
+*  pBuffer    : Pointer to a buffer into which the callback should write the reply (max. 64 bytes).
+*
+* Return:
+*  >= 0:          Audio control request was handled by the callback and response data was put into pBuffer.
+*                The callback function must return the length of the response data which will be send to the host.
+*  < 0 :          Audio control request was not handled by the callback (i.e. illegal request or parameters).
+*                The stack will STALL the request.
+*
+*******************************************************************************/
+#if USBD_AC_AUDIO_VERSION == 1
+static int audio_control_get_callback(const USBD_AC_CONTROL_INFO* pReqInfo, U8* pBuffer) {
+    U32 Value;
+
+    switch (pReqInfo->ID) {
+    case USBD_AC_ID_EP_Speaker + USB_AC_SAMPLING_FREQ_CONTROL:
+        switch (pReqInfo->bRequest) {
+        case USB_AC_REQ_MIN:
+        case USB_AC_REQ_MAX:
+        case USB_AC_REQ_CUR:
+            Value = AC_Global.CurrSpeakerFreq;
+            break;
+        case USB_AC_REQ_RES:
+            Value = 1;
+            break;
+        default:
+            return -1;
+        }
+        USBD_StoreU24LE(pBuffer, Value);
+        return 3;
+
+    case USBD_AC_ID_EP_Microphone + USB_AC_SAMPLING_FREQ_CONTROL:
+        switch (pReqInfo->bRequest) {
+        case USB_AC_REQ_MIN:
+        case USB_AC_REQ_MAX:
+        case USB_AC_REQ_CUR:
+            Value = AC_Global.CurrMicFreq;
+            break;
+        case USB_AC_REQ_RES:
+            Value = 1;
+            break;
+        default:
+            return -1;
+        }
+        USBD_StoreU24LE(pBuffer, Value);
+        return 3;
+
+    case USBD_AC_ID_UNIT_SpeakerControl + USB_AC_FU_VOLUME_CONTROL:
+        switch (pReqInfo->bRequest) {
+        case USB_AC_REQ_CUR:
+            Value = AC_Global.SpeakerVolume;
+            break;
+        case USB_AC_REQ_MIN:
+            Value = 0xF100;  /* -15 db */
+            break;
+        case USB_AC_REQ_MAX:
+            Value = 0x0000;   /* 0 db */
+            break;
+        case USB_AC_REQ_RES:
+            Value = 0x0001;   /* 1 db */
+            break;
+        default:
+            return -1;
+        }
+        USBD_StoreU16LE(pBuffer, Value);
+        return 2;
+
+    case USBD_AC_ID_UNIT_MicControl + USB_AC_FU_VOLUME_CONTROL:
+        switch (pReqInfo->bRequest) {
+        case USB_AC_REQ_CUR:
+            Value = AC_Global.MicrophoneVolume;
+            break;
+        case USB_AC_REQ_MIN:
+            Value = 0xF100;  /* -15 db */
+            break;
+        case USB_AC_REQ_MAX:
+            Value = 0x0000;   /* 0 db */
+            break;
+        case USB_AC_REQ_RES:
+            Value = 0x0001;   /* 1 db */
+            break;
+        default:
+            return -1;
+        }
+        USBD_StoreU16LE(pBuffer, Value);
+        return 2;
+
+    case USBD_AC_ID_UNIT_SpeakerControl + USB_AC_FU_MUTE_CONTROL:
+        if (pReqInfo->ChannelNumber == 0) {
+            pBuffer[0] = AC_Global.SpeakerMute[1];
+            pBuffer[1] = AC_Global.SpeakerMute[2];
+            return 2;
+        }
+        if (pReqInfo->ChannelNumber <= 2) {
+            pBuffer[0] = AC_Global.SpeakerMute[pReqInfo->ChannelNumber];
+            return 1;
+        }
+        break;
+
+    case USBD_AC_ID_UNIT_MicControl + USB_AC_FU_MUTE_CONTROL:
+        pBuffer[0] = AC_Global.MicrophoneMute;
+        return 1;
+
+    }
+    return -1;
+}
+#endif
+
+/********************************************************************************
+* Function Name: audio_control_set_callback
+********************************************************************************
+* Summary:
+*  For audio 1.0 control requests!
+*  Definition of the callback which is called when an audio set requests is received.
+*  This callback is called in interrupt context and must not block.
+*
+* Parameters:
+*  pReqInfo  : Contains information about the type of the control request.
+*  NumBytes  : Number of bytes in pBuffer.
+*  pBuffer    : Pointer to a buffer containing the request data.
+*
+* Return:
+*  == 0:          Audio control request was handled by the callback.
+*  != 0:          Audio control request was not handled by the callback (i.e. illegal request or parameters).
+*                The stack will STALL the request.
+*
+*******************************************************************************/
+#if USBD_AC_AUDIO_VERSION == 1
+static int audio_control_set_callback(const USBD_AC_CONTROL_INFO* pReqInfo, U32 NumBytes, const U8* pBuffer) {
+
+    switch (pReqInfo->ID) {
+    case USBD_AC_ID_EP_Speaker + USB_AC_SAMPLING_FREQ_CONTROL:
+        return 0;
+
+    case USBD_AC_ID_EP_Microphone + USB_AC_SAMPLING_FREQ_CONTROL:
+        return 0;
+
+    case USBD_AC_ID_UNIT_SpeakerControl + USB_AC_FU_VOLUME_CONTROL:
+        if (pReqInfo->bRequest == USB_AC_REQ_CUR && NumBytes == 2) {
+            memcpy(usb_comm_cur_volume, pBuffer, sizeof(usb_comm_cur_volume));
+            AC_Global.SpeakerVolume = USBD_GetU16LE(pBuffer);
+        }
+        return 0;
+
+    case USBD_AC_ID_UNIT_MicControl + USB_AC_FU_VOLUME_CONTROL:
+        if (pReqInfo->bRequest == USB_AC_REQ_CUR && NumBytes == 2) {
+            AC_Global.MicrophoneVolume = USBD_GetU16LE(pBuffer);
+        }
+        return 0;
+
+    case USBD_AC_ID_UNIT_SpeakerControl + USB_AC_FU_MUTE_CONTROL:
+        if (pReqInfo->ChannelNumber == 0 && NumBytes == 2) {
+            AC_Global.SpeakerMute[1] = pBuffer[0];
+            AC_Global.SpeakerMute[2] = pBuffer[1];
+            return 0;
+        }
+        if (pReqInfo->ChannelNumber <= 2) {
+            AC_Global.SpeakerMute[pReqInfo->ChannelNumber] = *pBuffer;
+            return 0;
+        }
+        break;
+
+    case USBD_AC_ID_UNIT_MicControl + USB_AC_FU_MUTE_CONTROL:
+        AC_Global.MicrophoneMute = *pBuffer;
+        return 0;
+    }
+    return -1;
+}
+#endif
 
 /*******************************************************************************
 * Function Name: audio_app_touch_events
@@ -710,40 +843,165 @@ static void audio_app_touch_events(uint32_t widget, touch_event_t event, uint32_
 
     switch (widget)
     {
-        case CY_CAPSENSE_LINEARSLIDER0_WDGT_ID:
+    case CY_CAPSENSE_LINEARSLIDER0_WDGT_ID:
+    {
+        /* Check the direction to change the volume */
+        if (TOUCH_SLIDE_RIGHT == event)
         {
-            /* Check the direction to change the volume */
-            if (TOUCH_SLIDE_RIGHT == event)
-            {
-                touch_audio_control_status = AUDIO_HID_REPORT_VOLUME_UP;
-                audio_app_control_report[0] = 0x01;
-                audio_app_control_report[1] = touch_audio_control_status;
-            }
-            if (TOUCH_SLIDE_LEFT == event)
-            {
-                touch_audio_control_status = AUDIO_HID_REPORT_VOLUME_DOWN;
-                audio_app_control_report[0] = 0x01;
-                audio_app_control_report[1] = touch_audio_control_status;
-            }
-            break;
+            touch_audio_control_status = AUDIO_HID_REPORT_VOLUME_UP;
+            audio_app_control_report[0] = 0x01;
+            audio_app_control_report[1] = touch_audio_control_status;
         }
-        case CY_CAPSENSE_BUTTON0_WDGT_ID:
+        if (TOUCH_SLIDE_LEFT == event)
         {
-            /* Play/Pause on Button 0 lift */
-            if (TOUCH_LIFT == event)
-            {
-                touch_audio_control_status = AUDIO_HID_REPORT_PLAY_PAUSE;
-                audio_app_control_report[0] = 0x01;
-                audio_app_control_report[1] = touch_audio_control_status;
-            }
-            break;
+            touch_audio_control_status = AUDIO_HID_REPORT_VOLUME_DOWN;
+            audio_app_control_report[0] = 0x01;
+            audio_app_control_report[1] = touch_audio_control_status;
         }
-        default:
+        break;
+    }
+    case CY_CAPSENSE_BUTTON0_WDGT_ID:
+    {
+        /* Play/Pause on Button 0 lift */
+        if (TOUCH_LIFT == event)
         {
-            break;
+            touch_audio_control_status = AUDIO_HID_REPORT_PLAY_PAUSE;
+            audio_app_control_report[0] = 0x01;
+            audio_app_control_report[1] = touch_audio_control_status;
         }
+        break;
+    }
+    default:
+    {
+        break;
+    }
     }
 }
+
+/********************************************************************************
+* Function Name: audio_class_init_data
+********************************************************************************
+* Summary:
+*  Initialization data for the Audio class instance.
+*
+* Parameters:
+*  None
+*
+* Return:
+*  None
+*
+*******************************************************************************/
+void audio_class_init_data(void) {
+    USBD_AC_INIT_DATA  InitData;
+
+    USB_MEMSET(&InitData, 0, sizeof(InitData));
+    InitData.pACConfig = USB_AC_CONFIGURATION;
+    InitData.pfControlGet = audio_control_get_callback;
+    InitData.pfControlSet = audio_control_set_callback;
+    InitData.pfSetAlternate = audio_set_interface_control_callback;
+
+    USBD_AC_Add(&InitData);
+
+    Mail_Box = xQueueCreateStatic(SEGGER_COUNTOF(Msg_Buff), sizeof(MESSAGE), (uint8_t*)Msg_Buff, &Static_Queue);
+
+}
+
+/*********************************************************************
+* Function name: add_hid_control
+**********************************************************************
+* Summary:
+*  Add HID mouse class to USB stack
+*
+* Parameters:
+*  None
+*
+* Return:
+*  USBD_AUDIO_HANDLE - Handle for added hid instance
+**********************************************************************/
+static USB_HID_HANDLE add_hid_control(void) {
+
+    USB_HID_HANDLE hInst;
+
+    USB_ADD_EP_INFO   EPIntIn;
+
+    memset(&hid_init_data, 0, sizeof(hid_init_data));
+    EPIntIn.Flags = 0;                           // Flags not used.
+    EPIntIn.InDir = USB_DIR_IN;                 // IN direction (Device to Host)
+    EPIntIn.Interval = 8;                            // Interval of 1 ms (125 us * 8)
+    EPIntIn.MaxPacketSize = 2;                           // Report size.
+    EPIntIn.TransferType = USB_TRANSFER_TYPE_INT;        // Endpoint type - Interrupt.
+    hid_init_data.EPIn = USBD_AddEPEx(&EPIntIn, NULL, 0);
+
+    hid_init_data.pReport = hid_report;
+    hid_init_data.NumBytesReport = sizeof(hid_report);
+    hInst = USBD_HID_Add(&hid_init_data);
+
+    return hInst;
+}
+
+#ifdef COMPONENT_AK4954A
+
+/*******************************************************************************
+* Function Name: audio_app_update_codec_volume
+********************************************************************************
+* Summary:
+*   Update the audio codec volume by sending an I2C message.
+*
+* Parameters:
+*  None
+*
+* Return:
+*  None
+*******************************************************************************/
+static void audio_app_update_codec_volume(void)
+{
+    int16_t  vol_usb = ((int16_t)usb_comm_cur_volume[1]) * 256 +
+        ((int16_t)usb_comm_cur_volume[0]);
+
+    audio_app_volume = (-vol_usb) / 64;
+
+    /* Check if the volume changed */
+    if (audio_app_volume != audio_app_prev_volume)
+    {
+        ak4954a_adjust_volume(audio_app_volume);
+        audio_app_prev_volume = audio_app_volume;
+    }
+    /* Check if mute settings changed */
+    if (1 == speaker_mute)
+    {
+        ak4954a_adjust_volume(AK4954A_HP_MUTE_VALUE);
+    }
+}
+
+/*******************************************************************************
+* Function Name: mi2c_transmit
+********************************************************************************
+* Summary:
+*  I2C Master function to transmit data to the given address.
+*
+* Parameters:
+*  uint8_t reg_addr: address to be updated
+*  uint8_t data: 8-bit data to be written in the register
+*
+* Return:
+*  cy_rslt_t - I2C master transaction error status.
+*             Returns CY_RSLT_SUCCESS if succeeded.
+*
+*******************************************************************************/
+static cy_rslt_t mi2c_transmit(uint8_t reg_addr, uint8_t data)
+{
+    cy_rslt_t result;
+    uint8_t buffer[AK4954A_PACKET_SIZE];
+
+    buffer[0] = reg_addr;
+    buffer[1] = data;
+
+    /* Send the data over the I2C */
+    result = cyhal_i2c_master_write(&mi2c, AK4954A_I2C_ADDR, buffer, AK4954A_PACKET_SIZE, MI2C_TIMEOUT_MS, true);
+    return result;
+}
+
+#endif
 
 /*******************************************************************************
 * Function Name: audio_clock_init
@@ -861,67 +1119,170 @@ static void audio_clock_init(void)
     }
 }
 
-
-#ifdef COMPONENT_AK4954A
-
-/*******************************************************************************
-* Function Name: audio_app_update_codec_volume
-********************************************************************************
+/*********************************************************************
+* Function name: audio_app_init
+**********************************************************************
 * Summary:
-*   Update the audio codec volume by sending an I2C message.
+*  Initializes hardware peripherals necessary for this audio application
 *
 * Parameters:
 *  None
 *
 * Return:
 *  None
-*******************************************************************************/
-static void audio_app_update_codec_volume(void)
-{
-    int16_t  vol_usb = ((int16_t) usb_comm_cur_volume[1])*256 + 
-                       ((int16_t) usb_comm_cur_volume[0]);
-
-    audio_app_volume = (-vol_usb) / 64;
-
-    /* Check if the volume changed */
-    if (audio_app_volume != audio_app_prev_volume)
-    {
-        ak4954a_adjust_volume(audio_app_volume);
-        audio_app_prev_volume = audio_app_volume;
-    }
-    /* Check if mute settings changed */
-    if (1 == speaker_mute)
-    {
-        ak4954a_adjust_volume(AK4954A_HP_MUTE_VALUE);
-    }
-}
-
-/*******************************************************************************
-* Function Name: mi2c_transmit
-********************************************************************************
-* Summary:
-*  I2C Master function to transmit data to the given address.
-*
-* Parameters:
-*  uint8_t reg_addr: address to be updated
-*  uint8_t data: 8-bit data to be written in the register
-*
-* Return:
-*  cy_rslt_t - I2C master transaction error status.
-*              Returns CY_RSLT_SUCCESS if succeeded.
-*
-*******************************************************************************/
-static cy_rslt_t mi2c_transmit(uint8_t reg_addr, uint8_t data)
+**********************************************************************/
+void audio_app_init(void)
 {
     cy_rslt_t result;
-    uint8_t buffer[AK4954A_PACKET_SIZE];
 
-    buffer[0] = reg_addr;
-    buffer[1] = data;
+    /* Initialize the audio clock based on audio sample rate */
+    audio_clock_init();
 
-    /* Send the data over the I2C */
-    result = cyhal_i2c_master_write(&mi2c, AK4954A_I2C_ADDR, buffer, AK4954A_PACKET_SIZE, MI2C_TIMEOUT_MS, true);
-    return result;
+    /* Initialize the User  LED */
+    result = cyhal_gpio_init(CYBSP_USER_LED, CYHAL_GPIO_DIR_OUTPUT, CYHAL_GPIO_DRIVE_STRONG, CYBSP_LED_STATE_OFF);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+    }
+    /* Initialize the Master Clock with a PWM */
+    result = cyhal_pwm_init(&mclk_pwm, (cyhal_gpio_t)AUDIO_APP_MCLK_PIN, NULL);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+    }
+    result = cyhal_pwm_set_duty_cycle(&mclk_pwm, MCLK_DUTY_CYCLE, MCLK_FREQ_HZ);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+    }
+    result = cyhal_pwm_start(&mclk_pwm);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+    }
+    /* Wait for the MCLK to clock the audio codec */
+    result = cyhal_system_delay_ms(MCLK_CODEC_DELAY_MS);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+    }
+
+#ifdef COMPONENT_AK4954A
+    result = cyhal_i2c_init(&mi2c, CYBSP_I2C_SDA, CYBSP_I2C_SCL, NULL);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+    }
+    result = cyhal_i2c_configure(&mi2c, &mi2c_cfg);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+    }
+    result = ak4954a_init(mi2c_transmit);
+    if (result != 0)
+    {
+        NVIC_SystemReset();
+    }
+    ak4954a_activate();
+    result = ak4954a_adjust_volume(AK4954A_HP_DEFAULT_VOLUME);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+}
+#endif
+    /* Initialize the I2S block */
+    result = cyhal_i2s_init(&i2s, &i2s_tx_pins, &i2s_rx_pins, &i2s_config, &audio_clock);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+    }
+
+    USBD_Init();
+    USBD_EnableIAD();
+
+    /* Initialization data for the Audio class instance. */
+    audio_class_init_data();
+
+    USBD_SetLogFilter(USB_MTYPE_AUDIO);
+
+    /* Set device information*/
+    USBD_SetDeviceInfo(&usb_device_info);
+
+    /* Add HID Audio control endpoint to the USB stack */
+    usb_hid_control_context = add_hid_control();
+
+    /* Register and enable touch events */
+    touch_register_callback(audio_app_touch_events);
+    touch_enable_event(TOUCH_ALL, true);
+
+    /* Start the USB device stack */
+    USBD_Start();
+
+    BaseType_t rtos_task_status;
+    rtos_task_status = xTaskCreate(audio_app_run, "RUN Task", RTOS_STACK_DEPTH, NULL, RTOS_TASK_PRIORITY, &rtos_audio_run_task);
+    if (pdPASS != rtos_task_status)
+    {
+        CY_ASSERT(0);
+    }
+    configASSERT(rtos_audio_run_task);
+
 }
 
+/********************************************************************************
+* Function Name: audio_app_process
+********************************************************************************
+* Summary:
+*   Main audio task. Initialize the USB communication and the audio application.
+*   In the main loop, process requests to change
+*   the volume.
+*
+* Parameters:
+*  void *arg - arguments for audio processing function
+*
+* Return:
+*  None
+*
+*******************************************************************************/
+void audio_app_process(void* arg) {
+    volatile bool usb_suspended = false;
+    volatile bool usb_connected = false;
+
+    (void)arg;
+
+    audio_app_init();
+
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(DELAY_TICKS));
+        if (usb_suspend_flag)
+        {
+            if (!usb_suspended)
+            {
+                usb_suspended = true;
+                usb_connected = false;
+            }
+        }
+        else
+        {
+            if (!usb_connected)
+            {
+                usb_connected = true;
+                usb_suspended = false;
+            }
+            USBD_HID_Write(usb_hid_control_context, audio_app_control_report, 2, 0);
+
+            audio_app_control_report[0] = 0x01;
+            audio_app_control_report[1] = 0;
+
+            /* Send out report data */
+            USBD_HID_Write(usb_hid_control_context, audio_app_control_report, 2, 0);
+            cyhal_gpio_write(CYBSP_USER_LED, CYBSP_LED_STATE_ON);
+
+#ifdef COMPONENT_AK4954A
+            audio_app_update_codec_volume();
 #endif
+        }
+    }
+}
+
+/**************************** end of file ***************************/
